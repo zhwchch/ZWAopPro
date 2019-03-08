@@ -30,11 +30,9 @@ typedef struct ZWToolStruct {
     void (*myRelease)(__unsafe_unretained id obj);
     void (*pc)(__unsafe_unretained id o, NSString *pre);
     
-    void (*lock)(void *lock);
-    void (*unlock)(void *lock);
-    void (*rw_rdlock)(pthread_rwlock_t *lock);
-    void (*rw_wrlock)(pthread_rwlock_t *lock);
-    void (*rw_unlock)(pthread_rwlock_t *lock);
+    void (*rwReadLock)(pthread_rwlock_t *lock);
+    void (*rwWriteLock)(pthread_rwlock_t *lock);
+    void (*rwUnlock)(pthread_rwlock_t *lock);
 } ZWToolStruct;
 
 OS_ALWAYS_INLINE void ZWRetain() {
@@ -47,15 +45,20 @@ OS_ALWAYS_INLINE void pc(__unsafe_unretained id o, NSString *pre) {
     void *p = (__bridge void *)o;
     NSLog(@"%@ %@ %p：%@",pre, o, p, [o valueForKey:@"retainCount"]);
 }
-OS_ALWAYS_INLINE void ZWMyRetain(uintptr_t *isa_t) {
-    //    atomic_fetch_add(isa_t, (1ULL<<45));//C++原子操作，比较慢
-    uintptr_t carry;//不处理溢出，内部对象不可能溢出
-    *isa_t = __builtin_addcl(*isa_t,(1ULL<<45),0,&carry);
+
+/*  内部对象可以使用以下函数手动管理retainCount
+ 其中__builtin_xxxxx则是非原子的，性能较好，
+ 而atomic_fetch_xxx是原子操作，但整体开销会增加1/3.
+ */
+OS_ALWAYS_INLINE void ZWMyRetain(atomic_uintptr_t *isa_t) {
+    atomic_fetch_add(isa_t, (1ULL<<45));//C++原子操作，比较慢
+    //    uintptr_t carry;//不处理溢出，内部对象不可能溢出
+    //    *isa_t = __builtin_addcl(*isa_t, (1ULL<<45), 0, &carry);
 }
-OS_ALWAYS_INLINE void ZWMyRelease(uintptr_t *isa_t) {
-    //    atomic_fetch_sub(isa_t, (1ULL<<45));
-    uintptr_t carry;
-    *isa_t = __builtin_subcl(*isa_t,(1ULL<<45),0,&carry);
+OS_ALWAYS_INLINE void ZWMyRelease(atomic_uintptr_t *isa_t) {
+    atomic_fetch_sub(isa_t, (1ULL<<45));
+    //    uintptr_t carry;
+    //    *isa_t = __builtin_subcl(*isa_t, (1ULL<<45), 0, &carry);
 }
 
 OS_ALWAYS_INLINE void ZWRWRLock(pthread_rwlock_t *lock) {
@@ -68,31 +71,19 @@ OS_ALWAYS_INLINE void ZWRWUnlock(pthread_rwlock_t *lock) {
     pthread_rwlock_unlock(lock);
 }
 
-OS_ALWAYS_INLINE void ZWLock(void *lock) {
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
-    if (@available(iOS 10.0, *)) {
-        os_unfair_lock_lock((os_unfair_lock_t)lock);
-    }
-#else
-    pthread_mutex_lock(&lock);
-#endif
-}
-OS_ALWAYS_INLINE void ZWUnlock(void *lock) {
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
-    if (@available(iOS 10.0, *)) {
-        os_unfair_lock_unlock((os_unfair_lock_t)lock);
-    }
-#else
-    pthread_mutex_unlock(&lock);
-#endif
-}
+
 ZWToolStruct ZWTools = {ZWRetain, ZWRelease, (void *)ZWMyRetain, (void *)ZWMyRelease, pc,
-    ZWLock, ZWUnlock, ZWRWRLock, ZWRWWLock, ZWRWUnlock};
+    ZWRWRLock, ZWRWWLock, ZWRWUnlock};
 
 #pragma mark - container
 
 static Class _ZWObjectClass;
 
+/*  定义OC拟对象，通过malloc分配内存，然后初始化isa指针达到类似于OC对象的效果，
+ 这种对象可以直接放入字典，也可以使用MRC管理，同时还可以被ARC管理。能够减少
+ 对象创建和销毁的消耗，同时减少retain+release的次数。引入ZWMyRetain，
+ ZWMyRelease管理内部对象能极大降低retain+release的开销。
+ */
 typedef struct ZWAopIMPList {
     void *isa;
     union {
@@ -112,7 +103,10 @@ typedef struct ZWAopIMPAll {
     __unsafe_unretained id replace;
 } ZWAopIMPAll;
 
-
+/*  设计使用类似于RCU的机制，读取不加锁，写加锁（由外部加锁），写时先将原数据做拷贝，
+ 再修改拷贝，最后替换原始数据指针。这种机制下，原始数据需要延迟释放，所以十分依赖
+ retainCount机制。此机制适合读远多于写，而且拷贝开销并不算太大的情况。
+ */
 void ZWAopIMPListAdd(ZWAopIMPList **originPtr, void *imp) {
     ZWAopIMPList *origin = *originPtr;
     if (OS_EXPECT(!origin, 1)) {
@@ -140,6 +134,7 @@ void ZWAopIMPListAdd(ZWAopIMPList **originPtr, void *imp) {
     
     *originPtr = origin;
 }
+
 void ZWAopIMPListRemove(ZWAopIMPList **originPtr, void *imp) {
     ZWAopIMPList *origin = *originPtr;
     if (OS_EXPECT(!origin, 0)) return;
@@ -178,7 +173,7 @@ ZWAopIMPAll *ZWAopIMPAllNew() {
  CFDictionaryCreateMutable创建效率比[NSMutableDictionary dictionary]低很多，使用
  也没有NSDictionary方便，效率也高不了多少。最重要的是CFDictionaryRef也要求key和value
  为对象，所以不能使用selector作为key，只能将selector封装成NSNumber再使用，所以无法通过
- 避免创建对象来降低开销，不过好消息是NSNumber创建开销较小。（在队上分配内存是比较昂贵的操作，
+ 避免创建对象来降低开销，不过好消息是NSNumber创建开销较小。（在堆上分配内存是比较昂贵的操作，
  特别是大量分配（万次/秒），在这里频繁调用的场景尤其明显。）
  另外：CFDictionaryGetKeysAndValues这个函数似乎有bug，拿到的key和value数组不太对。
  目前该方案一半的开销开销在字典的查询上，想要再有明显优化就需要自定义容器了。或者想要再更大
@@ -187,30 +182,14 @@ ZWAopIMPAll *ZWAopIMPAllNew() {
 static NSMutableDictionary  *_ZWAllIMPs;
 static Class _ZWBlockClass;
 
-
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
-API_AVAILABLE(ios(10.0))
-static os_unfair_lock_t _ZWLock;
 static pthread_rwlock_t _ZWWrLock;
 
-#else
-static pthread_mutex_t _ZWLock;
-#endif
 
 #pragma mark - constructor
 
 __attribute__((constructor(2018))) void ZWInvocationInit() {
-    
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
-    if (@available(iOS 10.0, *)) {
-        _ZWLock = malloc(sizeof(os_unfair_lock));
-        _ZWLock->_os_unfair_lock_opaque = 0;
-        pthread_rwlock_init(&_ZWWrLock, NULL);
-    }
-#else
-    pthread_mutex_init(&_ZWLock, NULL);
-#endif
-    
+
+    pthread_rwlock_init(&_ZWWrLock, NULL);
     
     _ZWAllIMPs = [NSMutableDictionary dictionary];
     _ZWBlockClass = NSClassFromString(@"NSBlock");
@@ -325,13 +304,16 @@ void ZWGlobalOCSwizzle(void) __attribute__((optnone)){
     asm volatile("ldp    x29, x30, [sp], #0x10");
 }
 
-
+/*  本函数占性能开销的66%，-_-!!!
+ 两次hash和取值占45%，加解锁占18%
+ */
 OS_ALWAYS_INLINE ZWAopIMPAll *ZWGetAllImps(__unsafe_unretained id class, __unsafe_unretained id selKey) {
     
-    ZWTools.rw_rdlock(&_ZWWrLock);
+    ZWTools.rwReadLock(&_ZWWrLock);
     __unsafe_unretained NSDictionary *dict = _ZWAllIMPs[class];
     __unsafe_unretained id invocation = dict[selKey];
-    ZWTools.rw_unlock(&_ZWWrLock);
+    ZWTools.myRetain(invocation);
+    ZWTools.rwUnlock(&_ZWWrLock);
     
     return (__bridge ZWAopIMPAll *)invocation;
 }
@@ -393,13 +375,11 @@ OS_ALWAYS_INLINE ZWAopIMPAll *ZWAopInvocation(void **sp,
     //以前是用NSArray来作为容器，但使用结构体后，可以大幅提高性能
     ZWAopInfo info = {obj, sel, option};
     
+    //这里已经保持了一个强引用，否则在调用过程中，调用正好被移除，可能会crash。
     ZWAopIMPAll *allImps = allImpsCache ?: ZWGetAllImps(object_getClass(obj), selKey);
     if (OS_EXPECT(!allImps, 0)) return NULL;
     
-    //这里最好保持一个强引用，如果在调用过程中，调用正好被移除，可能会crash。
     NSInteger flag = option & ZWAopOptionBefore;
-    flag > 0 ? ZWTools.myRetain((__bridge id)(allImps)) : nil;
-    
     void **imps = flag > 0 ? (void **)allImps->before : (void **)allImps->after;
     int count = imps ? ((ZWAopIMPList *)imps)->count : 0;
     
@@ -507,7 +487,6 @@ OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     return retMethod;
 }
 
-
 id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     if (OS_EXPECT(!obj || !sel || !block, 0)) return nil;
     if (OS_EXPECT(![block isKindOfClass:_ZWBlockClass], 1)) return nil;
@@ -532,7 +511,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     NSNumber *selKey = @((NSUInteger)(void *)sel);
     NSMutableDictionary *originImps = nil;
     
-    ZWTools.rw_wrlock(&_ZWWrLock);
+    ZWTools.rwWriteLock(&_ZWWrLock);
     
     if (OS_EXPECT(!_ZWAllIMPs[(id<NSCopying>)class], 0)) {
         originImps = [NSMutableDictionary dictionary];
@@ -555,6 +534,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         allImps->frameLength = [sign frameLength] - 0xe0;
     }
     
+    
     if (OS_EXPECT(originImp != ZWGlobalOCSwizzle, 1)) {
         allImps->origin = originImp;
     }
@@ -570,7 +550,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         ZWAopIMPListAdd(&(allImps->after), (__bridge void *)(block));
     }
     
-    ZWTools.rw_unlock(&_ZWWrLock);
+    ZWTools.rwUnlock(&_ZWWrLock);
     method_setImplementation(method, ZWGlobalOCSwizzle);
     
     return block;
@@ -587,7 +567,10 @@ OS_ALWAYS_INLINE void ZWRemoveInvocation(__unsafe_unretained Class class,
         __unsafe_unretained id obj = invocations[key];
         ZWAopIMPAll *allImps = (__bridge ZWAopIMPAll *)obj;
         if (options & ZWAopOptionReplace) {
-            allImps->replace = nil;
+            if (identifier == allImps->replace) {
+                allImps->replace = nil;
+                ZWTools.release(identifier);
+            }
         }
         
         if (options & ZWAopOptionBefore) {
@@ -612,9 +595,9 @@ void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {
         class = class_isMetaClass(class) ? class : object_getClass(obj);
     }
     
-    ZWTools.rw_wrlock(&_ZWWrLock);
+    ZWTools.rwWriteLock(&_ZWWrLock);
     ZWRemoveInvocation(class, identifier, options);
-    ZWTools.rw_unlock(&_ZWWrLock);
+    ZWTools.rwUnlock(&_ZWWrLock);
 }
 
 #pragma mark - convenient api
