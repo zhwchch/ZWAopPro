@@ -12,7 +12,6 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <pthread.h>
-#import <stdatomic.h>
 
 #define ZWGlobalOCSwizzleStackSize  "#0xe0"
 #define ZWInvocationStackSize  "#0x60"
@@ -21,13 +20,12 @@
 #define ZWAopIMPListHeaderSize  16
 
 
+
 #pragma mark - tools
 
 typedef struct ZWToolStruct {
     void (*retain)(__unsafe_unretained id obj);
     void (*release)(__unsafe_unretained id obj);
-    void (*myRetain)(__unsafe_unretained id obj);
-    void (*myRelease)(__unsafe_unretained id obj);
     void (*pc)(__unsafe_unretained id o, NSString *pre);
     
     void (*rwReadLock)(pthread_rwlock_t *lock);
@@ -46,21 +44,6 @@ OS_ALWAYS_INLINE void pc(__unsafe_unretained id o, NSString *pre) {
     NSLog(@"%@ %@ %p：%@",pre, o, p, [o valueForKey:@"retainCount"]);
 }
 
-/*  内部对象可以使用以下函数手动管理retainCount
- 其中__builtin_xxxxx则是非原子的，性能较好，
- 而atomic_fetch_xxx是原子操作，但整体开销会增加1/3.
- */
-OS_ALWAYS_INLINE void ZWMyRetain(atomic_uintptr_t *isa_t) {
-    atomic_fetch_add(isa_t, (1ULL<<45));//C++原子操作，比较慢
-    //    uintptr_t carry;//不处理溢出，内部对象不可能溢出
-    //    *isa_t = __builtin_addcl(*isa_t, (1ULL<<45), 0, &carry);
-}
-OS_ALWAYS_INLINE void ZWMyRelease(atomic_uintptr_t *isa_t) {
-    atomic_fetch_sub(isa_t, (1ULL<<45));
-    //    uintptr_t carry;
-    //    *isa_t = __builtin_subcl(*isa_t, (1ULL<<45), 0, &carry);
-}
-
 OS_ALWAYS_INLINE void ZWRWRLock(pthread_rwlock_t *lock) {
     pthread_rwlock_rdlock(lock);
 }
@@ -72,7 +55,7 @@ OS_ALWAYS_INLINE void ZWRWUnlock(pthread_rwlock_t *lock) {
 }
 
 
-ZWToolStruct ZWTools = {ZWRetain, ZWRelease, (void *)ZWMyRetain, (void *)ZWMyRelease, pc,
+ZWToolStruct ZWTools = {ZWRetain, ZWRelease, pc,
     ZWRWRLock, ZWRWWLock, ZWRWUnlock};
 
 #pragma mark - container
@@ -81,8 +64,7 @@ static Class _ZWObjectClass;
 
 /*  定义OC拟对象，通过malloc分配内存，然后初始化isa指针达到类似于OC对象的效果，
  这种对象可以直接放入字典，也可以使用MRC管理，同时还可以被ARC管理。能够减少
- 对象创建和销毁的消耗，同时减少retain+release的次数。引入ZWMyRetain，
- ZWMyRelease管理内部对象能极大降低retain+release的开销。
+ 对象创建和销毁的消耗，同时减少retain+release的次数。
  */
 typedef struct ZWAopIMPList {
     void *isa;
@@ -144,6 +126,11 @@ void ZWAopIMPListRemove(ZWAopIMPList **originPtr, void *imp) {
     for (int i = 0; i < origin->count; ++i) {
         if (OS_EXPECT(p[i+2] == imp, 0)) {
             index = i;
+            /*  如果在ZWAopInvocation中，拿到了count，但还没有进入for循序，没有拿到block(imp)，
+             但调用了本函数，删除了对应的block(imp)，此后再进入for循序，则会crash，所以这里将其值
+             改为NULL，这样保证for循序中不会拿到已经释放的block(imp)指针。
+             */
+            p[i+2] = NULL;
         }
     }
     if (OS_EXPECT(index != -1, 1)) {
@@ -181,14 +168,12 @@ ZWAopIMPAll *ZWAopIMPAllNew() {
  */
 static NSMutableDictionary  *_ZWAllIMPs;
 static Class _ZWBlockClass;
-
 static pthread_rwlock_t _ZWWrLock;
 
 
 #pragma mark - constructor
 
 __attribute__((constructor(2018))) void ZWInvocationInit() {
-
     pthread_rwlock_init(&_ZWWrLock, NULL);
     
     _ZWAllIMPs = [NSMutableDictionary dictionary];
@@ -312,7 +297,6 @@ OS_ALWAYS_INLINE ZWAopIMPAll *ZWGetAllImps(__unsafe_unretained id class, __unsaf
     ZWTools.rwReadLock(&_ZWWrLock);
     __unsafe_unretained NSDictionary *dict = _ZWAllIMPs[class];
     __unsafe_unretained id invocation = dict[selKey];
-    ZWTools.myRetain(invocation);
     ZWTools.rwUnlock(&_ZWWrLock);
     
     return (__bridge ZWAopIMPAll *)invocation;
@@ -375,12 +359,24 @@ OS_ALWAYS_INLINE ZWAopIMPAll *ZWAopInvocation(void **sp,
     //以前是用NSArray来作为容器，但使用结构体后，可以大幅提高性能
     ZWAopInfo info = {obj, sel, option};
     
-    //这里已经保持了一个强引用，否则在调用过程中，调用正好被移除，可能会crash。
+    //ZWAopIMPAll分配之后不会被回收，即使所以的AOP都被删除，也不会被回收，所以也就不需要retain和release
     ZWAopIMPAll *allImps = allImpsCache ?: ZWGetAllImps(object_getClass(obj), selKey);
     if (OS_EXPECT(!allImps, 0)) return NULL;
     
     NSInteger flag = option & ZWAopOptionBefore;
-    void **imps = flag > 0 ? (void **)allImps->before : (void **)allImps->after;
+    void **imps = NULL;
+    
+    /*  before和after是ZWAopIMPList，其使用RCU机制，添加删除列表中元素，减少加锁的情况，
+     使用before和after列表，需要retain来保证调用过程中，原列表被替换时，不会立即被释放，
+     */
+    if (flag == ZWAopOptionBefore) {
+        ZWTools.retain((__bridge id)allImps->before);
+        imps = (void **)allImps->before;
+    } else {
+        ZWTools.retain((__bridge id)allImps->after);
+        imps = (void **)allImps->after;
+    }
+    
     int count = imps ? ((ZWAopIMPList *)imps)->count : 0;
     
     for (int i = 0; i < count; ++i) {
@@ -390,7 +386,11 @@ OS_ALWAYS_INLINE ZWAopIMPAll *ZWAopInvocation(void **sp,
             ZWAopInvocationCall(sp, block, allImps, &info, allImps->frameLength);
         }
     }
-    flag > 0 ? nil : ZWTools.myRelease((__bridge id)(allImps));
+    if (flag == ZWAopOptionBefore) {
+        ZWTools.release((__bridge id)allImps->before);
+    } else {
+        ZWTools.release((__bridge id)allImps->after);
+    }
     
     return allImps;
 }
@@ -580,9 +580,17 @@ OS_ALWAYS_INLINE void ZWRemoveInvocation(__unsafe_unretained Class class,
             ZWAopIMPListRemove(&(allImps->after), (__bridge void *)(identifier));
         }
         if (!(allImps->replace)
+            && allImps->before
+            && allImps->after
             && allImps->before->count == 0
             && allImps->after->count == 0) {
             //如果没有任何AOP可以还原
+            SEL sel = (SEL)[key unsignedLongLongValue];
+            Method method = ZWGetMethod(class, sel);//class_getInstanceMethod(class, sel)会获取父类的方法
+            IMP imp = method_getImplementation(method);
+            if (imp == ZWGlobalOCSwizzle) {
+                method_setImplementation(method, allImps->origin);
+            }
         }
     }
 }
