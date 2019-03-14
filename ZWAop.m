@@ -487,6 +487,87 @@ OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     return retMethod;
 }
 
+int ZWGetParamSubUnit(const char *type, char end) {
+    int level = 0;
+    const char *head = type;
+    
+    while (*type) {
+        if (!*type || (!level && (*type == end)))
+            return (int)(type - head);
+        
+        switch (*type) {
+            case ']': case '}': case ')': level--; break;
+            case '[': case '{': case '(': level += 1; break;
+        }
+        
+        type += 1;
+    }
+    
+    return 0;
+}
+//根据签名获取下一个参数
+const char *ZWGetParamUnit(const char *type,
+                           unsigned *intSizePtr,
+                           unsigned *floatSizePtr,
+                           BOOL *recalculate) {
+    while (1) {
+        switch (*type++) {
+            case 'O':
+            case 'n':
+            case 'o':
+            case 'N':
+            case 'r':
+            case 'V':
+                break;
+                
+            case '@':
+                if (type[0] == '?') type++;
+                if (intSizePtr) (*intSizePtr) += 8;
+                return type;
+                
+                //遇到以下三种类型，都认为需要使用NSMethodSignature重写计算frameLength的大小
+            case '[':
+                while ((*type >= '0') && (*type <= '9')) type += 1;
+                if (recalculate) *recalculate = YES;
+                return type + ZWGetParamSubUnit (type, ']') + 1;
+                
+            case '{':
+                if (recalculate) *recalculate = YES;
+                return type + ZWGetParamSubUnit (type, '}') + 1;
+                
+            case '(':
+                if (recalculate) *recalculate = YES;
+                return type + ZWGetParamSubUnit (type, ')') + 1;
+                
+            case 'f':
+            case 'd': if (floatSizePtr) (*floatSizePtr) += 8;; return type;
+            default: if (intSizePtr) (*intSizePtr) += 8;; return type;
+        }
+    }
+}
+//参考objc的method_getNumberOfArguments
+BOOL ZWIsNeedRecalculate(const char *type) {
+    unsigned intSize = 0;
+    unsigned floatSize = 0;
+    
+    //跳过返回值类型
+    type = ZWGetParamUnit(type, NULL, NULL, NULL);
+    while ((*type >= '0') && (*type <= '9')) type += 1;
+    
+    while (*type) {
+        BOOL recalculate;
+        type = ZWGetParamUnit(type, &intSize, &floatSize, &recalculate);
+        if (OS_EXPECT(recalculate, 0)) return recalculate;
+        
+        while ((*type >= '0') && (*type <= '9')) type += 1;
+    }
+    
+    //分别大概计算寄存器参数大小和浮点寄存器参数大小
+    if (OS_EXPECT(intSize > 64 || floatSize > 64, 0)) return YES;
+    return NO;
+}
+
+
 id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     if (OS_EXPECT(!obj || !sel || !block, 0)) return nil;
     if (OS_EXPECT(![block isKindOfClass:_ZWBlockClass], 1)) return nil;
@@ -528,12 +609,13 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         ZWTools.release((__bridge id)allImps);
     }
     
-    if (method_getNumberOfArguments(method) > 5) {//优化点：自定义预估函数
-        const char *type = method_getTypeEncoding(method);
+    const char *type = method_getTypeEncoding(method);
+    if (ZWIsNeedRecalculate(type)) {
         NSMethodSignature *sign = [NSMethodSignature signatureWithObjCTypes:type];
         allImps->frameLength = [sign frameLength] - 0xe0;
+    } else {
+        allImps->frameLength = 0;
     }
-    
     
     if (OS_EXPECT(originImp != ZWGlobalOCSwizzle, 1)) {
         allImps->origin = originImp;
