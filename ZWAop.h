@@ -31,17 +31,17 @@ extern "C" {
 #endif
     
     /*  obj可以传对象也可以传class，如果添加元类AOP，option增加ZWAopOptionMeta，
-        option可以通过组合传递来一次性添加多个切面，其会返回一个identifier，实际上就是block
+     option可以通过组合传递来一次性添加多个切面，其会返回一个identifier，实际上就是block
      */
     id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block);
     /*  移除的时候需要将该identifier作为参数来搜索，复合ZWAopOptionRemoveAop，将会移除
-        Method对应的所有切面调用。需要注意的是，如果多个Method共用一个切面，将移除所有。
+     Method对应的所有切面调用。需要注意的是，如果多个Method共用一个切面，将移除所有。
      */
     void ZWRemoveAop(id obj, id identifier, ZWAopOption options);
     
     
     
-
+    
     //convenient api as follows
     id ZWAddAopBefore(id obj, SEL sel, id block);
     id ZWAddAopAfter(id obj, SEL sel, id block);
@@ -53,7 +53,7 @@ extern "C" {
     void ZWRemoveAopClassMethod(id obj, id identifier, ZWAopOption options);
     //移除Class-Aop所有的切面调用
     void ZWRemoveAopClass(id obj, ZWAopOption options);
-
+    
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -17,7 +17,8 @@
 #define ZWInvocationStackSize  "#0x60"
 #define ZWAopInvocationCallStackSize "#0x30"
 #define ZWAopIMPListMaxCount  1
-#define ZWAopIMPListHeaderSize  16
+#define ZWAopIMPListHeaderSize  24
+#define ZWAopIMPListHeaderCount  ZWAopIMPListHeaderSize/8
 
 
 
@@ -66,6 +67,8 @@ static Class _ZWObjectClass;
  这种对象可以直接放入字典，也可以使用MRC管理，同时还可以被ARC管理。能够减少
  对象创建和销毁的消耗，同时减少retain+release的次数。
  */
+
+
 typedef struct ZWAopIMPList {
     void *isa;
     union {
@@ -73,6 +76,7 @@ typedef struct ZWAopIMPList {
         unsigned int count;
     };
     unsigned int maxCount;
+    long long only;
     void **imps;
 } ZWAopIMPList;
 
@@ -85,76 +89,121 @@ typedef struct ZWAopIMPAll {
     __unsafe_unretained id replace;
 } ZWAopIMPAll;
 
-/*  设计使用类似于RCU的机制，读取不加锁，写加锁（由外部加锁），写时先将原数据做拷贝，
- 再修改拷贝，最后替换原始数据指针。这种机制下，原始数据需要延迟释放，所以十分依赖
- retainCount机制。此机制适合读远多于写，而且拷贝开销并不算太大的情况。
- */
-void ZWAopIMPListAdd(ZWAopIMPList **originPtr, void *imp) {
-    ZWAopIMPList *origin = *originPtr;
-    if (OS_EXPECT(!origin, 1)) {
-        origin = malloc(ZWAopIMPListMaxCount + ZWAopIMPListHeaderSize);
-        *origin = (ZWAopIMPList){(__bridge void *)_ZWObjectClass, 0, ZWAopIMPListMaxCount, NULL};
-    }
-    if (OS_EXPECT(origin->count > origin->maxCount - 1, 1)) {
-        int orignSize = origin->maxCount * 8 + ZWAopIMPListHeaderSize;
-        
-        origin->maxCount = origin->maxCount * 2;
-        void *new = malloc(origin->maxCount * 8 + ZWAopIMPListHeaderSize);
-        memcpy(new, origin, orignSize);
-        void *tmp = origin;
-        origin = new;
-        
-        ZWTools.release((__bridge id)(tmp));
-    }
-    
-    if (OS_EXPECT(origin->count < origin->maxCount, 1)) {
-        void **p = (void **)origin;
-        int index = ++(origin->index);
-        p[index + 1] = imp;
-        ZWTools.retain((__bridge id)imp);
-    }
-    
-    *originPtr = origin;
-}
-
-void ZWAopIMPListRemove(ZWAopIMPList **originPtr, void *imp) {
-    ZWAopIMPList *origin = *originPtr;
-    if (OS_EXPECT(!origin, 0)) return;
-    
-    void **p = (void **)origin;
-    int index = -1;
-    for (int i = 0; i < origin->count; ++i) {
-        if (OS_EXPECT(p[i+2] == imp, 0)) {
-            index = i;
-            /*  如果在ZWAopInvocation中，拿到了count，但还没有进入for循序，没有拿到block(imp)，
-             但调用了本函数，删除了对应的block(imp)，此后再进入for循序，则会crash，所以这里将其值
-             改为NULL，这样保证for循序中不会拿到已经释放的block(imp)指针。
-             */
-            p[i+2] = NULL;
-        }
-    }
-    if (OS_EXPECT(index != -1, 1)) {
-        ZWAopIMPList *new = malloc(origin->maxCount * 8 + ZWAopIMPListHeaderSize);
-        int offset = (2 + index) * 8;
-        memcpy(new, origin, offset);
-        memcpy((void *)new + offset, (void *)origin + offset + 8, (origin->count - index - 1) * 8);
-        void *tmp = origin;
-        origin = new;
-        --(origin->count);
-        ZWTools.release((__bridge id)(tmp));
-        ZWTools.release((__bridge id)(imp));
-    }
-    
-    *originPtr = origin;
-}
-
-
 
 ZWAopIMPAll *ZWAopIMPAllNew() {
     ZWAopIMPAll *new = malloc(sizeof(ZWAopIMPAll));
     *new = (ZWAopIMPAll){(__bridge void *)_ZWObjectClass, 0, NULL, NULL, NULL, NULL};
     return new;
 };
+
+
+
+
+ZWAopIMPList *ZWAopIMPListNew(ZWAopIMPList *origin, int count) {
+    int size = count;
+    if (size <= 0) {
+        size = origin->maxCount * 2;
+    }
+    ZWAopIMPList *newSpace = (ZWAopIMPList *)malloc(size * 8 + ZWAopIMPListHeaderSize);
+    *newSpace = (ZWAopIMPList){(__bridge void *)_ZWObjectClass, 0, size, 0, NULL};
+    return newSpace;
+}
+
+void ZWAopIMPListCopy(ZWAopIMPList *origin, ZWAopIMPList *copy, int index) {
+    int count = copy->maxCount;
+    if (index < 0) {
+        memcpy(copy, origin, origin->maxCount * 8 + ZWAopIMPListHeaderSize);
+    } else {
+        int offset = (ZWAopIMPListHeaderCount + index) * 8;
+        memcpy(copy, origin, offset);
+        memcpy((void *)copy + offset, (void *)origin + offset + 8, (origin->count - index - 1) * 8);
+    }
+    copy->maxCount = count;
+}
+
+/*  设计使用类似于RCU的机制，读取不加锁，写加锁（由外部加锁），写时先将原数据做拷贝，
+ 再修改拷贝，最后替换原始数据指针。这种机制下，原始数据需要延迟释放，所以十分依赖
+ retainCount机制。此机制适合读远多于写，而且拷贝开销并不算太大的情况。
+ */
+void ZWAopIMPListAdd(ZWAopIMPList **originPtr, void *block, BOOL only) {
+    ZWAopIMPList *origin = *originPtr;
+    if (OS_EXPECT(!origin, 1)) {
+        origin = ZWAopIMPListNew(NULL, ZWAopIMPListMaxCount);
+    }
+    if (origin->only) {
+        NSLog(@"ZWAop: Can not add this only-aop, because an only-aop is already in the list.");
+        return;
+    }
+    
+    void *tmp = NULL;
+    if (only && origin->count > 0) {
+        ZWAopIMPList *newAop = ZWAopIMPListNew(NULL, ZWAopIMPListMaxCount);
+        tmp = origin;
+        origin = newAop;
+    } else if (OS_EXPECT(origin->count > origin->maxCount - 1, 1)) {
+        void *newAop = ZWAopIMPListNew(origin, 0);
+        ZWAopIMPListCopy(origin, newAop, -1);
+        
+        tmp = origin;
+        origin = newAop;
+    }
+    
+    if (OS_EXPECT(origin->count < origin->maxCount, 1)) {
+        void **p = (void **)origin;
+        int index = ++ (origin->index);
+        p[index + ZWAopIMPListHeaderCount - 1] = block;
+        p[ZWAopIMPListHeaderCount - 1] = (void *)(unsigned long long)(only ? 1 : 0);
+        ZWTools.retain((__bridge id)block);
+    }
+    
+    *originPtr = origin;
+    ZWTools.release((__bridge id)(tmp));
+}
+
+void ZWAopIMPListRemove(ZWAopIMPList **originPtr, void *block) {
+    ZWAopIMPList *origin = *originPtr;
+    if (OS_EXPECT(!origin, 0)) return;
+    
+    void **p = (void **)origin;
+    int index = -1;
+    for (int i = 0; i < origin->count; ++i) {
+        if (OS_EXPECT(p[i + ZWAopIMPListHeaderCount] == block, 0)) {
+            index = i;
+            /*  如果在ZWAopInvocation中，拿到了count，但还没有进入for循序，没有拿到block(imp)，
+             但调用了本函数，删除了对应的block(imp)，此后再进入for循序，则会crash，所以这里将其值
+             改为NULL，这样保证for循序中不会拿到已经释放的block(imp)指针。
+             */
+            p[i + ZWAopIMPListHeaderCount] = NULL;
+        }
+    }
+    
+    void *tmp = NULL;
+    
+    if (OS_EXPECT(index != -1, 1)) {
+        void *newAop = ZWAopIMPListNew(origin, 0);
+        ZWAopIMPListCopy(origin, newAop, index);
+        
+        tmp = origin;
+        origin = newAop;
+        -- (origin->count);
+    }
+    
+    *originPtr = origin;
+    
+    ZWTools.release((__bridge id)(tmp));
+    ZWTools.release((__bridge id)(block));
+}
+
+void ZWAopIMPListRemoveAll(ZWAopIMPList **originPtr) {
+    void *tmp = NULL;
+    ZWAopIMPList *newAop = ZWAopIMPListNew(*originPtr, ZWAopIMPListMaxCount);
+    tmp = *originPtr;
+    *originPtr = newAop;
+    
+    ZWTools.release((__bridge id)(tmp));
+}
+
+
 
 /*  选用NSDictionary字典作为关联容器，其查询插入效率很高。使用CFDictionaryRef替代意义不大，
  CFDictionaryCreateMutable创建效率比[NSMutableDictionary dictionary]低很多，使用
@@ -368,6 +417,7 @@ OS_ALWAYS_INLINE ZWAopIMPAll *ZWAopInvocation(void **sp,
     
     /*  before和after是ZWAopIMPList，其使用RCU机制，添加删除列表中元素，减少加锁的情况，
      使用before和after列表，需要retain来保证调用过程中，原列表被替换时，不会立即被释放，
+     当然这里也可以利用ARC来管理imps。
      */
     if (flag == ZWAopOptionBefore) {
         ZWTools.retain((__bridge id)allImps->before);
@@ -381,7 +431,7 @@ OS_ALWAYS_INLINE ZWAopIMPAll *ZWAopInvocation(void **sp,
     
     for (int i = 0; i < count; ++i) {
         //这里也需要一个强引用
-        id block = (__bridge id)(imps[i+2]);//第一二个不是imp，跳过
+        id block = (__bridge id)(imps[i+ZWAopIMPListHeaderCount]);//第一二三个不是imp，跳过
         if (OS_EXPECT(block != nil, 1)) {
             ZWAopInvocationCall(sp, block, allImps, &info, allImps->frameLength);
         }
@@ -594,6 +644,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     
     ZWTools.rwWriteLock(&_ZWWrLock);
     
+    //取出class对应的调用，否则初始化容器
     if (OS_EXPECT(!_ZWAllIMPs[(id<NSCopying>)class], 0)) {
         originImps = [NSMutableDictionary dictionary];
         _ZWAllIMPs[(id<NSCopying>)class] = originImps;
@@ -601,6 +652,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         originImps = _ZWAllIMPs[(id<NSCopying>)class];
     }
     
+    //取出对应selector的调用实例ZWAopIMPAll，如果不存在就创建一个新实例同时存入容器，再release一次
     ZWAopIMPAll *allImps = (__bridge ZWAopIMPAll *)(originImps[selKey]);
     
     if (OS_EXPECT(!allImps, 1)) {
@@ -609,6 +661,8 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         ZWTools.release((__bridge id)allImps);
     }
     
+    //计算栈参大小，即frameLength的大小，先用预估函数ZWIsNeedRecalculate估算大小，
+    //如果肯定没有栈参，则frameLength=0，否则再调用NSMethodSignature计算准确栈参大小
     const char *type = method_getTypeEncoding(method);
     if (ZWIsNeedRecalculate(type)) {
         NSMethodSignature *sign = [NSMethodSignature signatureWithObjCTypes:type];
@@ -617,6 +671,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         allImps->frameLength = 0;
     }
     
+    //设置原始调用，替换调用，前切面和后切面值
     if (OS_EXPECT(originImp != ZWGlobalOCSwizzle, 1)) {
         allImps->origin = originImp;
     }
@@ -626,10 +681,10 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     }
     
     if (options & ZWAopOptionBefore) {
-        ZWAopIMPListAdd(&(allImps->before), (__bridge void *)(block));
+        ZWAopIMPListAdd(&(allImps->before), (__bridge void *)(block), (options & ZWAopOptionOnly));
     }
     if (options & ZWAopOptionAfter) {
-        ZWAopIMPListAdd(&(allImps->after), (__bridge void *)(block));
+        ZWAopIMPListAdd(&(allImps->after), (__bridge void *)(block), (options & ZWAopOptionOnly));
     }
     
     ZWTools.rwUnlock(&_ZWWrLock);
@@ -656,10 +711,12 @@ OS_ALWAYS_INLINE void ZWRemoveInvocation(__unsafe_unretained Class class,
         }
         
         if (options & ZWAopOptionBefore) {
-            ZWAopIMPListRemove(&(allImps->before), (__bridge void *)(identifier));
+            (options & ZWAopOptionRemoveAop) ? ZWAopIMPListRemoveAll(&(allImps->before))
+                                             : ZWAopIMPListRemove(&(allImps->before), (__bridge void *)(identifier));
         }
         if (options & ZWAopOptionAfter) {
-            ZWAopIMPListRemove(&(allImps->after), (__bridge void *)(identifier));
+            (options & ZWAopOptionRemoveAop) ? ZWAopIMPListRemoveAll(&(allImps->after))
+                                             : ZWAopIMPListRemove(&(allImps->after), (__bridge void *)(identifier));
         }
         if (!(allImps->replace)
             && allImps->before
