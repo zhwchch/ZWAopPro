@@ -20,11 +20,11 @@ typedef NS_OPTIONS(NSInteger, ZWAopOption) {
     ZWAopOptionMeta = 1 << 12,
     ZWAopOptionRemoveAop = 1 << 13,
 };
-typedef struct ZWAopInfo {
+typedef struct ZWAopInvocationInfo {
     __unsafe_unretained id obj;
     SEL sel;
     ZWAopOption opt;
-} ZWAopInfo;
+} ZWAopInvocationInfo;
 
 #ifdef __cplusplus
 extern "C" {
