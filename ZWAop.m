@@ -16,17 +16,18 @@
 #define ZWGlobalOCSwizzleStackSize  "#0xe0"
 #define ZWInvocationStackSize  "#0x60"
 #define ZWAopInvocationCallStackSize "#0x30"
-#define ZWAopImpsMaxCount  1
+#define ZWAopImpsInitCount  1
 #define ZWAopImpsHeaderSize  24
-#define ZWAopImpsHeaderCount  ZWAopImpsHeaderSize/8
-#define ZWMemeryBarrer()  asm volatile("dmb ish")
+#define ZWAopMachineLength  8
+#define ZWAopImpsHeaderCount  ZWAopImpsHeaderSize/ZWAopMachineLength
+#define ZWMemeryBarrier()  asm volatile("dmb ish": : : "memory")
 
 
 
 #pragma mark - tools
 
 typedef struct ZWToolStruct {
-    void (*retain)(__unsafe_unretained id obj);
+    void* (*retain)(__unsafe_unretained id obj);
     void (*release)(__unsafe_unretained id obj);
     void (*pc)(__unsafe_unretained id o, NSString *pre);
     
@@ -57,7 +58,7 @@ OS_ALWAYS_INLINE void ZWRWUnlock(pthread_rwlock_t *lock) {
 }
 
 
-ZWToolStruct ZWTools = {ZWRetain, ZWRelease, pc,
+ZWToolStruct ZWTools = {(void *)ZWRetain, ZWRelease, pc,
     ZWRWRLock, ZWRWWLock, ZWRWUnlock};
 
 #pragma mark - container
@@ -104,7 +105,7 @@ ZWAopImps *ZWAopImpsNew(ZWAopImps *aopImps, int count) {
     if (count <= 0) {
         count = aopImps->maxCount * 2;
     }
-    ZWAopImps *newSpace = (ZWAopImps *)malloc(count * 8 + ZWAopImpsHeaderSize);
+    ZWAopImps *newSpace = (ZWAopImps *)malloc(count * ZWAopMachineLength + ZWAopImpsHeaderSize);
     *newSpace = (ZWAopImps){(__bridge void *)_ZWObjectClass, 0, count, 0, NULL};
     return newSpace;
 }
@@ -112,11 +113,11 @@ ZWAopImps *ZWAopImpsNew(ZWAopImps *aopImps, int count) {
 void ZWAopImpsCopy(ZWAopImps *aopImps, ZWAopImps *copy, int index) {
     int count = copy->maxCount;
     if (index < 0) {
-        memcpy(copy, aopImps, aopImps->maxCount * 8 + ZWAopImpsHeaderSize);
+        memcpy(copy, aopImps, aopImps->maxCount * ZWAopMachineLength + ZWAopImpsHeaderSize);
     } else {
-        int offset = (ZWAopImpsHeaderCount + index) * 8;
+        int offset = (ZWAopImpsHeaderCount + index) * ZWAopMachineLength;
         memcpy(copy, aopImps, offset);
-        memcpy((void *)copy + offset, (void *)aopImps + offset + 8, (aopImps->count - index - 1) * 8);
+        memcpy((void *)copy + offset, (void *)aopImps + offset + ZWAopMachineLength, (aopImps->count - index - 1) * ZWAopMachineLength);
     }
     copy->maxCount = count;
 }
@@ -128,7 +129,7 @@ void ZWAopImpsCopy(ZWAopImps *aopImps, ZWAopImps *copy, int index) {
 void ZWAopImpsAdd(ZWAopImps **aopImpsPtr, void *block, BOOL only) {
     ZWAopImps *aopImps = *aopImpsPtr;
     if (OS_EXPECT(!aopImps, 1)) {
-        aopImps = ZWAopImpsNew(NULL, ZWAopImpsMaxCount);
+        aopImps = ZWAopImpsNew(NULL, ZWAopImpsInitCount);
     }
     if (aopImps->only) {
         NSLog(@"ZWAop: Can not add this only-aop, because an only-aop is already in the list.");
@@ -137,9 +138,9 @@ void ZWAopImpsAdd(ZWAopImps **aopImpsPtr, void *block, BOOL only) {
     
     void *tmp = NULL;
     if (only && aopImps->count > 0) {
-        ZWAopImps *newAops = ZWAopImpsNew(NULL, ZWAopImpsMaxCount);
+        ZWAopImps *newAopImps = ZWAopImpsNew(NULL, ZWAopImpsInitCount);
         tmp = aopImps;
-        aopImps = newAops;
+        aopImps = newAopImps;
     } else if (OS_EXPECT(aopImps->count > aopImps->maxCount - 1, 1)) {
         void *newAops = ZWAopImpsNew(aopImps, 0);
         ZWAopImpsCopy(aopImps, newAops, -1);
@@ -150,13 +151,15 @@ void ZWAopImpsAdd(ZWAopImps **aopImpsPtr, void *block, BOOL only) {
     
     if (OS_EXPECT(aopImps->count < aopImps->maxCount, 1)) {
         void **p = (void **)aopImps;
-        int index = ++ (aopImps->index);
+        int index = (aopImps->index) + 1;
         p[index + ZWAopImpsHeaderCount - 1] = block;
         p[ZWAopImpsHeaderCount - 1] = (void *)(unsigned long long)(only ? 1 : 0);
+        ZWMemeryBarrier();
+        aopImps->index = index;
         ZWTools.retain((__bridge id)block);
     }
-    //内存屏障技术，保证originPtr被替换之前，origin数据已经写入完成。
-    ZWMemeryBarrer();
+    //内存屏障技术，保证aopImpsPtr被替换之前，aopImps数据已经写入完成。
+    ZWMemeryBarrier();
     
     *aopImpsPtr = aopImps;
     ZWTools.release((__bridge id)(tmp));
@@ -180,30 +183,37 @@ void ZWAopImpsRemove(ZWAopImps **aopImpsPtr, void *block) {
     }
     
     void *tmp = NULL;
-    
     if (OS_EXPECT(index != -1, 1)) {
-        void *newAops = ZWAopImpsNew(aopImps, 0);
-        ZWAopImpsCopy(aopImps, newAops, index);
+        void *newAopImps = ZWAopImpsNew(aopImps, 0);
+        ZWAopImpsCopy(aopImps, newAopImps, index);
         
         tmp = aopImps;
-        aopImps = newAops;
+        aopImps = newAopImps;
         -- (aopImps->count);
+        
+        ZWMemeryBarrier();
+        
+        ZWTools.release((__bridge id)(block));
     }
-    ZWMemeryBarrer();
     
     *aopImpsPtr = aopImps;
-    
     ZWTools.release((__bridge id)(tmp));
-    ZWTools.release((__bridge id)(block));
 }
 
 void ZWAopImpsRemoveAll(ZWAopImps **aopImpsPtr) {
     void *tmp = NULL;
-    ZWAopImps *newAops = ZWAopImpsNew(*aopImpsPtr, ZWAopImpsMaxCount);
+    ZWAopImps *newAopImps = ZWAopImpsNew(*aopImpsPtr, ZWAopImpsInitCount);
     tmp = *aopImpsPtr;
     
-    ZWMemeryBarrer();
-    *aopImpsPtr = newAops;
+    ZWMemeryBarrier();
+    *aopImpsPtr = newAopImps;
+    
+    void **imps = tmp;
+    int count = ((ZWAopImps *)imps)->count;
+    for (int i = 0; i < count; ++i) {
+        __unsafe_unretained id block = (__bridge id)(imps[i+ZWAopImpsHeaderCount]);//第一二三个不是imp，跳过
+        ZWTools.release(block);
+    }
     
     ZWTools.release((__bridge id)(tmp));
 }
@@ -231,7 +241,9 @@ __attribute__((constructor(2018))) void ZWInvocationInit() {
     pthread_rwlock_init(&_ZWWrLock, NULL);
     
     _ZWAllInfo = [NSMutableDictionary dictionary];
+    
     _ZWBlockClass = NSClassFromString(@"NSBlock");
+    
     void *classPtr = (__bridge void *)([NSObject class]);
     //isa的末位表示是否是优化的指针，如果是纯指针，其会调用sidetable_retain来存储retainCount
     uintptr_t newISA = (uintptr_t)classPtr | 0x1;
@@ -370,6 +382,7 @@ OS_ALWAYS_INLINE IMP ZWGetReplaceImp(ZWAopInfo *info) {
 }
 
 IMP ZWGetAopImp(__unsafe_unretained id block) __attribute__((optnone)) {
+    if (!block) return NULL;
     uint64_t *p = (__bridge void *)(block);
     return (IMP)*(p + 2);
 }
@@ -413,39 +426,32 @@ OS_ALWAYS_INLINE ZWAopInfo *ZWAopInvocation(void **sp,
     //以前是用NSArray来作为容器，但使用结构体后，可以大幅提高性能
     ZWAopInvocationInfo invokeInfo = {obj, sel, option};
     
-    //ZWAopImpAll分配之后不会被回收，即使所以的AOP都被删除，也不会被回收，所以也就不需要retain和release
+    //ZWAopInfo分配之后不会被回收，即使所以的AOP都被删除，也不会被回收，所以也就不需要retain和release
     ZWAopInfo *info = infoCache ?: ZWGetAopInfo(object_getClass(obj), selKey);
     if (OS_EXPECT(!info, 0)) return NULL;
-    
-    NSInteger flag = option & ZWAopOptionBefore;
-    void **imps = NULL;
     
     /*  before和after是ZWAopImps，其使用RCU机制，添加删除列表中元素，减少加锁的情况，
      使用before和after列表，需要retain来保证调用过程中，原列表被替换时，不会立即被释放，
      当然这里也可以利用ARC来管理imps。
      */
-    if (flag == ZWAopOptionBefore) {
-        ZWTools.retain((__bridge id)info->before);
-        imps = (void **)info->before;
+    void **imps = NULL;
+    if ((option & ZWAopOptionBefore) == ZWAopOptionBefore) {
+        imps = ZWTools.retain((__bridge id)info->before);
     } else {
-        ZWTools.retain((__bridge id)info->after);
-        imps = (void **)info->after;
+        imps = ZWTools.retain((__bridge id)info->after);
     }
+    if (OS_EXPECT(!imps, 0)) return info;
     
-    int count = imps ? ((ZWAopImps *)imps)->count : 0;
-    
+    int count = ((ZWAopImps *)imps)->count;
     for (int i = 0; i < count; ++i) {
-        //这里也需要一个强引用
-        id block = (__bridge id)(imps[i+ZWAopImpsHeaderCount]);//第一二三个不是imp，跳过
+        //这里也需要retain
+        void *block = ZWTools.retain((__bridge id)(imps[i+ZWAopImpsHeaderCount]));//第一二三个不是imp，跳过
         if (OS_EXPECT(block != nil, 1)) {
-            ZWAopInvocationCall(sp, block, info, &invokeInfo, info->frameLength);
+            ZWAopInvocationCall(sp, (__bridge id)block, info, &invokeInfo, info->frameLength);
         }
+        ZWTools.release((__bridge id)(void *)block);
     }
-    if (flag == ZWAopOptionBefore) {
-        ZWTools.release((__bridge id)info->before);
-    } else {
-        ZWTools.release((__bridge id)info->after);
-    }
+    ZWTools.release((__bridge id)(void *)imps);
     
     return info;
 }
@@ -542,7 +548,7 @@ OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     return retMethod;
 }
 
-int ZWGetParamSubUnit(const char *type, char end) {
+static int ZWGetParamSubUnit(const char *type, char end) {
     int level = 0;
     const char *head = type;
     
@@ -561,10 +567,10 @@ int ZWGetParamSubUnit(const char *type, char end) {
     return 0;
 }
 //根据签名获取下一个参数
-const char *ZWGetParamUnit(const char *type,
-                           unsigned *intSizePtr,
-                           unsigned *floatSizePtr,
-                           BOOL *recalculate) {
+static const char *ZWGetParamUnit(const char *type,
+                                  unsigned *intSizePtr,
+                                  unsigned *floatSizePtr,
+                                  BOOL *recalculate) {
     while (1) {
         switch (*type++) {
             case 'O':
@@ -577,7 +583,7 @@ const char *ZWGetParamUnit(const char *type,
                 
             case '@':
                 if (type[0] == '?') type++;
-                if (intSizePtr) (*intSizePtr) += 8;
+                if (intSizePtr) (*intSizePtr) += ZWAopMachineLength;
                 return type;
                 
                 //遇到以下三种类型，都认为需要使用NSMethodSignature重写计算frameLength的大小
@@ -595,13 +601,13 @@ const char *ZWGetParamUnit(const char *type,
                 return type + ZWGetParamSubUnit(type, ')') + 1;
                 
             case 'f':
-            case 'd': if (floatSizePtr) (*floatSizePtr) += 8;; return type;
-            default: if (intSizePtr) (*intSizePtr) += 8;; return type;
+            case 'd': if (floatSizePtr) (*floatSizePtr) += ZWAopMachineLength;; return type;
+            default: if (intSizePtr) (*intSizePtr) += ZWAopMachineLength;; return type;
         }
     }
 }
 //参考objc的method_getNumberOfArguments
-BOOL ZWIsNeedRecalculate(const char *type) {
+static BOOL ZWIsNeedRecalculate(const char *type) {
     unsigned intSize = 0;
     unsigned floatSize = 0;
     
@@ -636,8 +642,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         class = class_isMetaClass(class) ? class : object_getClass(obj);
     }
     
-    Method method = ZWGetMethod(class, sel);//class_getInstanceMethod(class, sel)会获取父类的方法
-    
+    Method method = class_getInstanceMethod(class, sel);//会获取父类的方法,ZWGetMethod(class, sel);则不会
     IMP originImp = method_getImplementation(method);
     if (!originImp) {
         NSLog(@"ZWAop: Can not find '%s' in class '%@'.", sel_getName(sel), class);
@@ -657,7 +662,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         originImps = _ZWAllInfo[(id<NSCopying>)class];
     }
     
-    //取出对应selector的调用实例ZWAopImpAll，如果不存在就创建一个新实例同时存入容器，再release一次
+    //取出对应selector的调用实例ZWAopInfo，如果不存在就创建一个新实例同时存入容器，再release一次
     ZWAopInfo *info = (__bridge ZWAopInfo *)(originImps[selKey]);
     
     if (OS_EXPECT(!info, 1)) {
@@ -716,11 +721,11 @@ OS_ALWAYS_INLINE void ZWRemoveInvocation(__unsafe_unretained Class class,
         }
         
         if (options & ZWAopOptionBefore) {
-            (options & ZWAopOptionRemoveAop) ? ZWAopImpsRemoveAll(&(info->before))
+            !(options & ZWAopOptionRemoveAop) ? ZWAopImpsRemoveAll(&(info->before))
             : ZWAopImpsRemove(&(info->before), (__bridge void *)(identifier));
         }
         if (options & ZWAopOptionAfter) {
-            (options & ZWAopOptionRemoveAop) ? ZWAopImpsRemoveAll(&(info->after))
+            !(options & ZWAopOptionRemoveAop) ? ZWAopImpsRemoveAll(&(info->after))
             : ZWAopImpsRemove(&(info->after), (__bridge void *)(identifier));
         }
         if (!(info->replace)
